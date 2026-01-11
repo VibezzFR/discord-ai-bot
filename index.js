@@ -1,6 +1,6 @@
 import { Client, GatewayIntentBits } from "discord.js";
-import Groq from "groq-sdk";
 import express from "express";
+import Groq from "groq-sdk";
 import "dotenv/config";
 
 /* ===================== CONFIG ===================== */
@@ -9,14 +9,12 @@ const PORT = Number(process.env.PORT || 3000);
 const REMOTE_PASSWORD = process.env.REMOTE_PASSWORD || "";
 
 const TICKET_CATEGORY_ID = process.env.TICKET_CATEGORY_ID || "";
-const CASHAPP_LINK = process.env.CASHAPP_LINK || "https://cash.app/$RimarrX";
-const PAYPAL_LINK = process.env.PAYPAL_LINK || "https://www.paypal.com/paypalme/lmLandon";
+const WEBSITE_LINK = process.env.WEBSITE_LINK || "https://your-website-link-here.com";
 
-const USD_PER_100K = 1.5;
-const ROBUX_PER_100K = 150;
-const MAX_MONEY = 1750000;
+// Credits pricing rule (as you specified)
+const ROBUX_PER_CREDIT_DOLLAR = 100; // because 150 Robux = $1.50 -> 100 Robux per $1
 
-/* ===================== GAMEPASSES ===================== */
+/* ===================== GAMEPASSES (Robux) ===================== */
 
 const gamepasses = [
   { robux: 50, url: "https://www.roblox.com/game-pass/678549030/" },
@@ -33,18 +31,18 @@ const gamepasses = [
   { robux: 1000, url: "https://www.roblox.com/game-pass/678189829/" }
 ];
 
-/* ===================== SAFE GROQ INIT (won't crash bot) ===================== */
+/* ===================== OPTIONAL GROQ (not required) ===================== */
 
 let groq = null;
 try {
   if (process.env.GROQ_API_KEY) {
     groq = new Groq({ apiKey: process.env.GROQ_API_KEY });
-    console.log("Groq initialized");
+    console.log("Groq initialized (optional)");
   } else {
-    console.log("GROQ_API_KEY missing — AI disabled (checkout still works)");
+    console.log("GROQ_API_KEY missing — AI disabled (not needed for this flow)");
   }
-} catch (e) {
-  console.error("Groq failed to initialize — AI disabled (checkout still works)");
+} catch {
+  console.log("Groq init failed — AI disabled (not needed for this flow)");
   groq = null;
 }
 
@@ -67,53 +65,46 @@ function isTicketChannel(obj) {
   return ch.parentId === TICKET_CATEGORY_ID;
 }
 
-function formatNumber(n) {
-  return Number(n).toLocaleString("en-US");
-}
-
-function parseAmount(textRaw) {
-  if (!textRaw) return null;
-  const text = textRaw.toLowerCase().trim();
-
-  // "max money" keywords
-  if (text.includes("max")) return MAX_MONEY;
-  if (text.includes("maximum")) return MAX_MONEY;
-
-  // remove commas/spaces
-  const cleaned = text.replace(/,/g, "").replace(/\s+/g, " ");
-
-  // match first number + optional suffix
-  const m = cleaned.match(/(\d+(\.\d+)?)(\s*)(k|m)?/i);
-  if (!m) return null;
-
-  let n = Number(m[1]);
-  if (!Number.isFinite(n) || n <= 0) return null;
-
-  const suffix = (m[4] || "").toLowerCase();
-  if (suffix === "k") n *= 1000;
-  if (suffix === "m") n *= 1000000;
-
-  n = Math.round(n);
-  if (n <= 0) return null;
-
-  return Math.min(n, MAX_MONEY);
-}
-
-function detectMethod(textRaw) {
-  const t = (textRaw || "").toLowerCase();
-  if (t.includes("robux") || t.includes("rbx") || t.includes("r$")) return "ROBUX";
-  if (t.includes("real") || t.includes("cash") || t.includes("usd") || t.includes("$") || t.includes("paypal") || t.includes("cashapp"))
-    return "USD";
+function detectPayMethod(text) {
+  const s = (text || "").toLowerCase();
+  if (s.includes("robux") || s.includes("rbx") || s.includes("r$")) return "ROBUX";
+  if (s.includes("real") || s.includes("money") || s.includes("cash") || s.includes("usd") || s.includes("$")) return "REAL";
   return null;
 }
 
-function usdTotal(gameMoney) {
-  return (gameMoney / 100000) * USD_PER_100K;
+function isYes(text) {
+  const s = (text || "").trim().toLowerCase();
+  return s === "yes" || s === "y" || s === "yeah" || s === "yea" || s === "yep";
 }
 
-function robuxTotal(gameMoney) {
-  // round to nearest 50 so it matches your gamepass step sizes better
-  const exact = (gameMoney / 100000) * ROBUX_PER_100K;
+function isNo(text) {
+  const s = (text || "").trim().toLowerCase();
+  return s === "no" || s === "n" || s === "nope" || s === "nah";
+}
+
+// Parse $ amount for credits. Must be a dollar amount like: 1.50, $5, 10, 12.75
+function parseDollarAmount(textRaw) {
+  if (!textRaw) return null;
+
+  let s = textRaw.trim().toLowerCase();
+  s = s.replace(/,/g, "");
+  s = s.replace(/\s+/g, " ");
+
+  // Find something that looks like $12.50 or 12.50
+  const m = s.match(/\$?\s*(\d+(\.\d{1,2})?)/);
+  if (!m) return null;
+
+  const val = Number(m[1]);
+  if (!Number.isFinite(val) || val <= 0) return null;
+
+  // Round to cents
+  return Math.round(val * 100) / 100;
+}
+
+function robuxNeededFromCreditsDollars(creditDollars) {
+  // 150 robux = $1.50 credits -> 100 robux = $1 credits
+  const exact = creditDollars * ROBUX_PER_CREDIT_DOLLAR;
+  // round to nearest 50 to match pass sizes better
   return Math.round(exact / 50) * 50;
 }
 
@@ -145,13 +136,14 @@ const tickets = new Map();
 function resetTicket(channelId, userId) {
   tickets.set(channelId, {
     userId,
-    step: "ASK_AMOUNT",
-    amount: null,
-    method: null
+    step: "ASK_METHOD",
+    method: null,
+    wantsContinue: null,
+    creditDollars: null
   });
 }
 
-/* ===================== MAIN BOT LOGIC ===================== */
+/* ===================== MAIN TICKET FLOW ===================== */
 
 client.on("messageCreate", async (message) => {
   try {
@@ -162,105 +154,100 @@ client.on("messageCreate", async (message) => {
     const channelId = message.channel.id;
     let t = tickets.get(channelId);
 
-    // If first time in this ticket, start the flow and ignore their first message content
+    // First message in a fresh ticket: start flow + ignore what they typed
     if (!t) {
       resetTicket(channelId, message.author.id);
-      return message.channel.send("How much game money do you want to buy? (ex: 700k, 1m, 1,750,000, max money)");
+      return message.channel.send("Are you paying with **real money** or **robux**?");
     }
 
-    // Only the person who started the ticket flow can answer it
+    // Only original user controls the flow
     if (message.author.id !== t.userId) return;
 
     const raw = message.content || "";
     const txt = raw.trim().toLowerCase();
 
-    // Restart command works any time
+    // Restart works anytime
     if (txt === "restart" || txt === "reset" || txt === "new order" || txt === "new") {
       resetTicket(channelId, message.author.id);
-      return message.channel.send("How much game money do you want to buy? (ex: 700k, 1m, max money)");
+      return message.channel.send("Are you paying with **real money** or **robux**?");
     }
 
-    // After checkout is done: STOP responding (optional final message is already sent at checkout)
-    if (t.step === "DONE") {
-      return; // ignore everything else
-    }
+    // If stopped, ignore everything
+    if (t.step === "STOPPED") return;
 
-    // Ask amount
-    if (t.step === "ASK_AMOUNT") {
-      let amt = parseAmount(raw);
-
-      // If they typed weird phrasing and you still want AI help parsing, you can enable this
-      // but you asked to stop chatting after checkout; this only helps amount parsing.
-      if (!amt && groq) {
-        try {
-          const res = await groq.chat.completions.create({
-            model: "llama-3.1-8b-instant",
-            temperature: 0,
-            messages: [
-              {
-                role: "system",
-                content:
-                  `Extract ONLY the game money amount as an integer.
-If user means "max money"/"max", return ${MAX_MONEY}.
-Understand: 700k, 1m, 1.75m, 1,750,000, "1 mil 750k".
-If no clear amount, return null.
-Output strict JSON only: {"amount": number|null}`
-              },
-              { role: "user", content: raw }
-            ]
-          });
-
-          const out = res.choices?.[0]?.message?.content?.trim() || "";
-          const s = out.indexOf("{");
-          const e = out.lastIndexOf("}");
-          if (s !== -1 && e !== -1) {
-            const obj = JSON.parse(out.slice(s, e + 1));
-            if (typeof obj.amount === "number" && Number.isFinite(obj.amount) && obj.amount > 0) {
-              amt = Math.min(Math.round(obj.amount), MAX_MONEY);
-            }
-          }
-        } catch {
-          // ignore AI parse failures
-        }
-      }
-
-      if (!amt) {
-        return message.channel.send("I didn’t understand the amount. Try: `700k`, `1m`, `1,750,000`, or `max money`.");
-      }
-
-      t.amount = amt;
-      t.step = "ASK_METHOD";
-      return message.channel.send(`Got it: **${formatNumber(amt)}** game money. Are you paying with **real money** or **robux**?`);
-    }
-
-    // Ask payment method + send checkout links + STOP responding afterward
+    // Step 1: Ask method
     if (t.step === "ASK_METHOD") {
-      const method = detectMethod(raw);
+      const method = detectPayMethod(raw);
       if (!method) return message.channel.send("Reply with **real money** or **robux**.");
 
       t.method = method;
 
-      if (method === "USD") {
-        const total = usdTotal(t.amount);
-        t.step = "DONE";
+      if (method === "REAL") {
+        t.step = "STOPPED";
 
-        await message.channel.send(
-          `Total: **$${total.toFixed(2)}**\nCash App: ${CASHAPP_LINK}\nPayPal: ${PAYPAL_LINK}`
-        );
+        // EXACT sentence you required
+        await message.channel.send("Check The Website To See If The Amount You're Wanting Is Available.");
+        await message.channel.send(`Website: ${WEBSITE_LINK}`);
 
-        // OPTIONAL FINAL MESSAGE (you asked for this)
-        return message.channel.send("Send payment using the links above. Type `restart` to start a new order.");
+        return; // stop responding
       }
 
       if (method === "ROBUX") {
-        const total = robuxTotal(t.amount);
-        t.step = "DONE";
+        t.step = "ROBEXPLAIN";
 
-        await message.channel.send(`Total: **${total} Robux**\n\n${buildGamepassList(total)}`);
-
-        // OPTIONAL FINAL MESSAGE (you asked for this)
-        return message.channel.send("Buy the passes above. Type `restart` to start a new order.");
+        // EXACT sentence you required (must match exactly)
+        await message.channel.send(
+          "You're Gonna Be Buying Store Credits, Store Credits Are Like A Card With A Balance On It, You Can Use These Credits To Buy Accounts On The Website"
+        );
+        return message.channel.send("Do you wish to continue with the order? Reply **yes** or **no**.");
       }
+    }
+
+    // Step 2 (Robux): Confirm continue
+    if (t.step === "ROBEXPLAIN") {
+      if (isNo(raw)) {
+        t.step = "STOPPED";
+        return; // stop responding
+      }
+      if (!isYes(raw)) {
+        return message.channel.send("Reply **yes** or **no**.");
+      }
+
+      t.step = "ASK_CREDITS";
+
+      await message.channel.send(
+        "How many **Credits** do you want to buy?\n" +
+          "You MUST send a **$ amount** when saying how many credits you want. (Example: `$1.50`, `$5`, `10.00`)\n" +
+          "Your Robux payment will be calculated into credits.\n" +
+          "**150 Robux = $1.50 Credits.**"
+      );
+      return;
+    }
+
+    // Step 3 (Robux): Ask credits amount in dollars
+    if (t.step === "ASK_CREDITS") {
+      const dollars = parseDollarAmount(raw);
+      if (!dollars) {
+        return message.channel.send(
+          "I didn’t understand that. Please send a **$ amount** like: `$1.50`, `$5`, `10.00`."
+        );
+      }
+
+      t.creditDollars = dollars;
+
+      const totalRobux = robuxNeededFromCreditsDollars(dollars);
+      const passList = buildGamepassList(totalRobux);
+
+      t.step = "STOPPED";
+
+      await message.channel.send(
+        `Credits Amount: **$${dollars.toFixed(2)}**\n` +
+          `Robux Needed (calculated): **${totalRobux} Robux**\n\n` +
+          `Buy these gamepasses:\n${passList}\n\n` +
+          `Please send a **screenshot proof** of buying after you're done.`
+      );
+
+      return; // stop responding after this
     }
   } catch (err) {
     console.error("Message handler crash prevented:", err);
